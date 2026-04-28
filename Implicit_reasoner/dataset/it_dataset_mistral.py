@@ -9,6 +9,7 @@ import numpy as np
 
 from dataset.base_dataset import ImageVideoBaseDataset
 from dataset.video_utils import VIDEO_READER_FUNCS
+from dataset.tcr_video_sampling import sample_tcr_frame_indices, parse_duration, is_inside_mask
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,93 @@ class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
             cur_instruction += q
         return conversation.strip(), cur_instruction.strip()
 
+
+    def _normalize_answer_letter(self, ans, options_len):
+        if ans is None:
+            return ""
+        if isinstance(ans, int):
+            idx = ans
+        elif isinstance(ans, str):
+            t = ans.strip().upper()
+            if t in ["A", "B", "C", "D", "E"]:
+                idx = ord(t) - ord("A")
+            else:
+                try:
+                    idx = int(t)
+                except Exception:
+                    idx = -1
+        else:
+            idx = -1
+        if 0 <= idx < options_len:
+            return chr(ord("A") + idx)
+        return ""
+
+    def get_correct_option_text(self, sample):
+        options = sample.get("options") or []
+        letter = self._normalize_answer_letter(sample.get("ans"), len(options))
+        if not letter:
+            return ""
+        idx = ord(letter) - ord("A")
+        try:
+            return str(options[idx]).strip()
+        except Exception:
+            return ""
+
+    def build_context_text(self, context):
+        if not context:
+            return ""
+        items = []
+        for qa in context:
+            if isinstance(qa, dict):
+                q = str(qa.get("question", "")).strip()
+                a = str(qa.get("answer", "")).strip()
+                if q or a:
+                    items.append(f"Q: {q} A: {a}")
+        text = "Context QA memory: " + "; ".join(items)
+        words = text.split()
+        if len(words) > 300:
+            text = " ".join(words[:300])
+        return text
+
+    def expand_open_answer(self, question, short_answer, correct_option_text):
+        q = (question or "").strip()
+        a1 = (short_answer or "").strip()
+        a2 = (correct_option_text or "").strip()
+        base = a2 if len(a2) > len(a1) and a2 else a1
+        if not base:
+            return ""
+        ql = q.lower()
+        if ql.startswith("why") or "reason" in ql or "purpose" in ql:
+            return f"The reason is that {base}."
+        if ql.startswith("how"):
+            return f"It is done by {base}."
+        if ql.startswith("what"):
+            return f"The most likely result is that {base}."
+        return base if base.endswith('.') else base + '.'
+
+    def build_open_conversation(self, question, rich_open_answer, context_text, msg):
+        convo = self.system
+        convo += f"{self.human_start} {self.start_token}{self.end_token}{msg.rstrip()} {self.human_end}"
+        inst = "The explicit evidence is hidden. Use contextual visual information, action-intent clues, and context QA memory to answer the implicit question in one complete sentence."
+        payload = inst + ("\n" + context_text if context_text else "") + f"\nQuestion: {question}"
+        convo += f" {self.human_start} {payload} {self.human_end} {rich_open_answer} {self.assist_end}"
+        return convo.strip()
+
+    def build_mc_conversation(self, question, options, answer_letter, context_text, msg):
+        if not options:
+            return ""
+        opts = []
+        for i, opt in enumerate(options):
+            if i < 5:
+                opts.append(f"({chr(ord('A') + i)}) {opt}")
+        option_block = "\n".join(opts)
+        convo = self.system
+        convo += f"{self.human_start} {self.start_token}{self.end_token}{msg.rstrip()} {self.human_end}"
+        inst = "The explicit evidence is hidden. Select the best option using contextual visual information, action-intent clues, and context QA memory."
+        payload = inst + ("\n" + context_text if context_text else "") + f"\nQuestion: {question}\n{option_block}\nAnswer with only the option letter."
+        convo += f" {self.human_start} {payload} {self.human_end} The answer is ({answer_letter}). {self.assist_end}"
+        return convo.strip()
+
     def __getitem__(self, index):
         try:
             # zou xia mian
@@ -187,10 +275,13 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
         self.sample_type = sample_type
         self.num_tries = num_tries
         self.add_second_msg = add_second_msg
+        self.tcr_multitask = False
 
         logger.info(f"Use {video_reader_type} for data in {ann_file}")
         if add_second_msg:
             logger.info(f"Add second message: The video contains X frames sampled at T seconds.")
+        if dynamic_config is not None and hasattr(dynamic_config, "model"):
+            self.tcr_multitask = bool(getattr(dynamic_config.model, "tcr_multitask", False))
 
     def __getitem__(self, index):
         try:
@@ -198,13 +289,9 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
             action_label = ann["action_label"]
             intent_label = ann["intent_label"]
             msg = ""
-            clip = None
-            # Todo 还得改
-            # if "start" in ann and "end" in ann:
             clip = ann["mask_duration"]
-            # MP4 -> video frames
             video, index, sec = self.load_and_transform_media_data_video(
-                index, ann["image"], return_fps=True, clip=clip,
+                index, ann["image"], return_fps=True, clip=(None if self.tcr_multitask else clip),
                 dynamic_config=self.dynamic_config
             )
             ann["gt_action_relation_intent"] = [f"{' '.join(qa['question'].split(' ')[2:])}: {qa['answer']}"
@@ -219,6 +306,28 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
                 # " " should be added in the start and end
                 msg = f" The video contains {len(sec)} frames sampled at {', '.join(sec)} seconds. "
                 # Todo process_QA
+            question = ann["qa"].get("question", "")
+            short_answer = ann["qa"].get("answer", "")
+            options = ann["qa"].get("options", []) or ann.get("options", [])
+            ans = ann["qa"].get("ans", ann["qa"].get("answer_idx", ann["qa"].get("answer_id", "")))
+            sample = {"options": options, "ans": ans}
+            answer_letter = self._normalize_answer_letter(ans, len(options))
+            correct_option_text = self.get_correct_option_text(sample)
+            context_text = self.build_context_text(ann.get("gt_action_relation_intent", []))
+            rich_open_answer = self.expand_open_answer(question, short_answer, correct_option_text)
+            sampled_seconds = ','.join(sec) if isinstance(sec, list) else ''
+            instruction = ("Extract parts of the contextual visual information that are beneficial for answering the question: " + question).strip()
+
+            if self.tcr_multitask:
+                open_conversation = self.build_open_conversation(question, rich_open_answer, context_text, msg)
+                mc_conversation = self.build_mc_conversation(question, options, answer_letter, context_text, msg) if options else ""
+                options_json = json.dumps(options, ensure_ascii=False)
+                return (video, open_conversation, instruction,
+                        gt_action_relation_intent, pred_action_relation_intent,
+                        action_label, intent_label, index,
+                        mc_conversation, options_json, answer_letter,
+                        context_text, question, rich_open_answer, sampled_seconds)
+
             conversation, instruction = self.process_qa(ann["qa"], msg)
             return (video, conversation, instruction,
                     gt_action_relation_intent, pred_action_relation_intent,

@@ -37,7 +37,7 @@ def train(
 
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", SmoothedValue(window=100, fmt="{value:.6f}"))
-    loss_names = ["loss"]
+    loss_names = ["loss", "loss_open_lm", "loss_mc_lm", "loss_option_ce", "loss_relation_ce", "loss_answer_verify"]
 
     media_types = get_media_types(train_loaders)
 
@@ -56,13 +56,27 @@ def train(
     train_loader = MetaLoader(name2loader=dict(list(zip(media_types, train_loaders))))
 
     iterator = metric_logger.log_every(train_loader, log_freq, header)
-    for i, (media_type, (image, text, instruction, gt_relation, pred_relation, action_label, intent_label, _)) in enumerate(iterator):
+    for i, (media_type, batch) in enumerate(iterator):
+
+        if len(batch) == 8:
+            image, text, instruction, gt_relation, pred_relation, action_label, intent_label, _ = batch
+            mc_text = options_json = answer_letter = context_text = raw_question = rich_open_answer = sampled_seconds = None
+        elif len(batch) == 15:
+            (image, text, instruction, gt_relation, pred_relation, action_label, intent_label, _,
+             mc_text, options_json, answer_letter, context_text, raw_question, rich_open_answer, sampled_seconds) = batch
+        else:
+            raise ValueError(f"Unexpected batch length: {len(batch)}")
 
         image = image.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast(enabled=config.fp16):
-            loss_dict = model(image, text, instruction, gt_relation, pred_relation, action_label, intent_label, epoch)
-            loss = sum(loss_dict.values())
+            loss_dict = model(
+                image, text, instruction, gt_relation, pred_relation, action_label, intent_label, epoch,
+                mc_text_input=mc_text, options_json=options_json, answer_letter=answer_letter,
+                context_text=context_text, raw_question=raw_question, rich_open_answer=rich_open_answer,
+                sampled_seconds=sampled_seconds,
+            )
+            loss = loss_dict["loss"]
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -75,6 +89,8 @@ def train(
 
         # logging
         for name in loss_names:
+            if name not in loss_dict:
+                continue
             value = loss_dict[name]
             value = value if isinstance(value, float) else value.item()
             metric_logger.update(**{f"{media_type}-{name}": value})
@@ -198,11 +214,10 @@ def main(config):
                 "epoch": epoch,
                 "global_step": global_step,
             }
+            torch.save(save_obj, join(config.output_dir, f"ckpt_{epoch:02d}.pth"))
             if config.get("save_latest", False):
                 torch.save(save_obj, join(config.output_dir, "ckpt_latest.pth"))
-            else:
-                torch.save(save_obj, join(config.output_dir, f"ckpt_{epoch:02d}.pth"))
-            if 22 < epoch:
+            if epoch in {10, 11, 22, 25}:
                 torch.save(save_obj, join(config.output_dir, f"ckpt_{epoch:02d}.pth"))
 
         if config.evaluate:
