@@ -2,12 +2,13 @@ import random
 import logging
 import ast
 import json
+import os
+from pathlib import Path
 
 import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
 from peft import get_peft_model, LoraConfig, TaskType
-from transformers import CLIPTokenizer, CLIPTextModel
 from ..blip2.blip2 import Blip2Base, disabled_train
 from ..icr_modules import Causal_intent_RelationHead, Vision_clue_enhancement, Vision_action_enhancement
 from ..tcr_modules import TCRMemorySelector, TCROptionClassifier, TCRAnswerVerifier, TCRContextQARetriever, mean_pool_text_embeds
@@ -61,16 +62,15 @@ class VideoChat2_it_mistral(Blip2Base):
         self.img_end_token = config.get("img_end_token", "</Image>")
         logger.info(f"Add instruction in qformer: {self.qformer_text_input}")
         self.CE_loss = torch.nn.CrossEntropyLoss()
-        # debug
-        self.clip_tokenizer = CLIPTokenizer.from_pretrained("/mnt/sdb/hg_model2/clip-vit-base-patch32")
-        self.clip_model = CLIPTextModel.from_pretrained("/mnt/sdb/hg_model2/clip-vit-base-patch32")
         self.debug = config.get("debug", False)
         use_flash_attention = config.get("use_flash_attention", False)
         self.use_lora = config.get("use_lora", False)
         lora_r = config.get("lora_r", 8)
         lora_alpha = config.get("lora_alpha", 32)
         lora_dropout = config.get("lora_dropout", 0.05)
-        self.clip_matching = False
+        self.clip_matching = bool(config.get("use_clip_text_matching", False))
+        self.clip_tokenizer = None
+        self.clip_model = None
         self.tokenizer = self.init_tokenizer(truncation_side="left")
         self.tokenizer.padding_side = "left"
         self.low_resource = low_resource
@@ -183,6 +183,20 @@ class VideoChat2_it_mistral(Blip2Base):
         self.option_classifier = TCROptionClassifier(self.mistral_model.config.hidden_size)
         self.answer_verifier = TCRAnswerVerifier(self.mistral_model.config.hidden_size)
         self.context_retriever = TCRContextQARetriever()
+
+        if self.clip_matching:
+            from transformers import CLIPTokenizer, CLIPTextModel
+            clip_path = config.get("clip_model_path", None)
+            if clip_path is None:
+                root = Path(os.environ.get("IVQA_ROOT", str(Path(__file__).resolve().parents[3])))
+                fallback = root / "weights" / "clip-vit-base-patch32"
+                clip_path = str(fallback) if fallback.exists() else None
+            if clip_path:
+                self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_path)
+                self.clip_model = CLIPTextModel.from_pretrained(clip_path)
+            else:
+                logger.warning("CLIP text matching enabled but no valid clip_model_path found; disabling.")
+                self.clip_matching = False
 
         # load weights of VideoChat2
         if videochat2_model_path:
@@ -434,7 +448,9 @@ class VideoChat2_it_mistral(Blip2Base):
         inputs_embeds = emb_fn(inp)
         attention_mask = torch.zeros([batch_size, txt_len], dtype=torch.long, device=img_embeds.device)
         targets = torch.ones([batch_size, txt_len], dtype=torch.long, device=img_embeds.device).fill_(-100)
-        inputs_embeds[:, :1] = self.mistral_tokenizer.bos_token_id
+        bos_ids = torch.full((batch_size, 1), self.mistral_tokenizer.bos_token_id, device=img_embeds.device, dtype=torch.long)
+        bos_embeds = emb_fn(bos_ids)
+        inputs_embeds[:, :1] = bos_embeds
         for idx in range(batch_size):
             input_len = min(input_embed_list[idx].shape[1], txt_len - 1)
             inputs_embeds[idx, 1:(input_len+1)] = input_embed_list[idx][:, :input_len]
@@ -492,6 +508,81 @@ class VideoChat2_it_mistral(Blip2Base):
             losses.append(self.CE_loss(logits.unsqueeze(0), torch.tensor([0], device=img_embeds.device)))
         return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=img_embeds.device)
 
+    def tcr_select_memory_for_inference(self, img_embeds_single, question, options_json, pred_relation, context_text, mode):
+        action_label = "[-1]"
+        intent_label = "[-1]"
+        selected_pairs, selected_context, _ = self._select_tcr_clues(img_embeds_single, question, options_json, pred_relation, action_label, intent_label, context_text, mode)
+        return selected_pairs, selected_context
+
+    def build_tcr_generation_embeds(self, img_embeds, prompt, use_image):
+        end_token = self.img_end_token if use_image else self.end_token
+        if end_token in prompt:
+            p_before, p_after = prompt.split(end_token, 1)
+            p_after = end_token + p_after
+        else:
+            p_before, p_after = prompt, ""
+        tok_before = self.mistral_tokenizer(p_before, return_tensors="pt", add_special_tokens=False).to(img_embeds.device)
+        tok_after = self.mistral_tokenizer(p_after, return_tensors="pt", add_special_tokens=False).to(img_embeds.device)
+        emb_fn = self.mistral_model.base_model.model.model.embed_tokens if self.use_lora else self.mistral_model.model.embed_tokens
+        return torch.cat([emb_fn(tok_before.input_ids), img_embeds, emb_fn(tok_after.input_ids)], dim=1)
+
+    def score_option_likelihood(self, img_embeds, prompt_prefix, option_targets, use_image):
+        scores = []
+        for target in option_targets:
+            prompt = f"{prompt_prefix} {target}"
+            loss = self.forward_legacy_with_embeds(img_embeds, [prompt], use_image)
+            scores.append(float(loss.detach().item()))
+        return scores
+
+    def score_options_classifier(self, img_embeds, question, options):
+        if not options:
+            return torch.zeros(0, device=img_embeds.device)
+        q_emb = self._text_embed_mean([question])[0]
+        o_emb = self._text_embed_mean([str(x) for x in options])
+        v_emb = img_embeds.mean(dim=0)
+        return self.option_classifier(v_emb, q_emb, o_emb)
+
+    def verify_open_candidates(self, img_embeds, question, candidates):
+        if not candidates:
+            return torch.zeros(0, device=img_embeds.device)
+        q_emb = self._text_embed_mean([question])[0]
+        v_emb = img_embeds.mean(dim=0)
+        a_emb = self._text_embed_mean([str(c) for c in candidates])
+        logits = [self.answer_verifier(v_emb, q_emb, a_emb[i]) for i in range(a_emb.shape[0])]
+        return torch.stack(logits)
+
+    def _answer_alignment_loss(self, img_embeds, rich_open_answer, options_json=None, answer_letter=None):
+        if not rich_open_answer:
+            return torch.tensor(0.0, device=img_embeds.device)
+        losses = []
+        bsz = len(rich_open_answer)
+        for i in range(bsz):
+            pos = (rich_open_answer[i] or "").strip()
+            if not pos:
+                continue
+            negs = []
+            try:
+                opts = json.loads(options_json[i]) if options_json and options_json[i] else []
+            except Exception:
+                opts = []
+            gt = (answer_letter[i] or "").strip().upper() if answer_letter else ""
+            gt_idx = ord(gt) - ord("A") if gt in ["A", "B", "C", "D", "E"] else -1
+            for j, o in enumerate(opts):
+                if j != gt_idx:
+                    negs.append(str(o))
+            if bsz > 1 and rich_open_answer[(i+1) % bsz]:
+                negs.append(str(rich_open_answer[(i+1) % bsz]))
+            if not negs:
+                continue
+            v = torch.nn.functional.normalize(img_embeds[i].mean(dim=0), dim=0)
+            pos_e = torch.nn.functional.normalize(self._text_embed_mean([pos])[0], dim=0)
+            neg_e = torch.nn.functional.normalize(self._text_embed_mean(negs), dim=1)
+            pos_sim = torch.matmul(v, pos_e)
+            neg_sim = torch.matmul(neg_e, v)
+            logits = torch.cat([pos_sim.unsqueeze(0), neg_sim], dim=0).unsqueeze(0) / 0.07
+            losses.append(self.CE_loss(logits, torch.tensor([0], device=img_embeds.device)))
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=img_embeds.device)
+
     def _forward_tcr(self, image, text_input, instruction, gt_relation, pred_relation, action_label, intent_label, epoch,
                      mc_text_input=None, options_json=None, answer_letter=None, context_text=None, raw_question=None,
                      rich_open_answer=None, sampled_seconds=None):
@@ -518,9 +609,10 @@ class VideoChat2_it_mistral(Blip2Base):
         loss_option_ce = self._option_classification_loss(img_embeds, raw_question or ['']*len(open_prompts), options_json or ['[]']*len(open_prompts), answer_letter or ['']*len(open_prompts))
         loss_relation_ce = torch.stack(rel_losses).mean() if rel_losses else torch.tensor(0.0, device=img_embeds.device)
         loss_answer_verify = self._answer_verifier_loss(img_embeds, raw_question or ['']*len(open_prompts), rich_open_answer or ['']*len(open_prompts), options_json or ['[]']*len(open_prompts), answer_letter or ['']*len(open_prompts))
+        loss_answer_align = self._answer_alignment_loss(img_embeds, rich_open_answer or ["" for _ in open_prompts], options_json=options_json, answer_letter=answer_letter)
         relation_weight = max(0.5, self.w_relation_ce - 0.09 * epoch)
-        loss = self.w_open_lm*loss_open_lm + self.w_mc_lm*loss_mc_lm + self.w_option_ce*loss_option_ce + relation_weight*loss_relation_ce + self.w_answer_verify*loss_answer_verify
-        return dict(loss=loss, loss_open_lm=loss_open_lm, loss_mc_lm=loss_mc_lm, loss_option_ce=loss_option_ce, loss_relation_ce=loss_relation_ce, loss_answer_verify=loss_answer_verify)
+        loss = self.w_open_lm*loss_open_lm + self.w_mc_lm*loss_mc_lm + self.w_option_ce*loss_option_ce + relation_weight*loss_relation_ce + self.w_answer_verify*loss_answer_verify + self.w_answer_align*loss_answer_align
+        return dict(loss=loss, loss_open_lm=loss_open_lm, loss_mc_lm=loss_mc_lm, loss_option_ce=loss_option_ce, loss_relation_ce=loss_relation_ce, loss_answer_verify=loss_answer_verify, loss_answer_align=loss_answer_align)
 
     def forward(self, image, text_input, instruction, gt_relation, pred_relation, action_label, intent_label, epoch, mc_text_input=None, options_json=None, answer_letter=None, context_text=None, raw_question=None, rich_open_answer=None, sampled_seconds=None):
         if self.tcr_multitask:
@@ -556,22 +648,19 @@ class VideoChat2_it_mistral(Blip2Base):
             for pred_index, pred in enumerate(pred_actions):
                 max_similarity = 0
                 best_match_index = None
-                self.clip_model = self.clip_model.to(img_embeds.device)
-
-                pred_inputs = self.clip_tokenizer(pred, return_tensors="pt", padding=True, truncation=True).to(
-                    img_embeds.device)
-                with torch.no_grad():
-                    pred_embedding = self.clip_model(**pred_inputs).last_hidden_state.mean(dim=1)
-
-                for gt_index, gt in enumerate(gt_actions):
-                    gt_inputs = self.clip_tokenizer(gt, return_tensors="pt", padding=True, truncation=True).to(
-                        img_embeds.device)
+                if self.clip_matching and self.clip_model is not None and self.clip_tokenizer is not None:
+                    self.clip_model = self.clip_model.to(img_embeds.device)
+                    pred_inputs = self.clip_tokenizer(pred, return_tensors="pt", padding=True, truncation=True).to(img_embeds.device)
                     with torch.no_grad():
-                        gt_embedding = self.clip_model(**gt_inputs).last_hidden_state.mean(dim=1)
-                    similarity = torch.nn.functional.cosine_similarity(pred_embedding, gt_embedding).item()
-                    if similarity > 0.65 and similarity > max_similarity:
-                        max_similarity = similarity
-                        best_match_index = gt_index
+                        pred_embedding = self.clip_model(**pred_inputs).last_hidden_state.mean(dim=1)
+                    for gt_index, gt in enumerate(gt_actions):
+                        gt_inputs = self.clip_tokenizer(gt, return_tensors="pt", padding=True, truncation=True).to(img_embeds.device)
+                        with torch.no_grad():
+                            gt_embedding = self.clip_model(**gt_inputs).last_hidden_state.mean(dim=1)
+                        similarity = torch.nn.functional.cosine_similarity(pred_embedding, gt_embedding).item()
+                        if similarity > 0.65 and similarity > max_similarity:
+                            max_similarity = similarity
+                            best_match_index = gt_index
 
                 if best_match_index is not None:
                     pairs.append({
@@ -770,7 +859,9 @@ class VideoChat2_it_mistral(Blip2Base):
         attention_mask = torch.zeros([batch_size, txt_len], dtype=torch.long).to(img_embeds.device)
         targets = torch.ones([batch_size, txt_len], dtype=torch.long).to(img_embeds.device).fill_(-100)
         # set bos_token
-        inputs_embeds[:, :1] = self.mistral_tokenizer.bos_token_id
+        bos_ids = torch.full((batch_size, 1), self.mistral_tokenizer.bos_token_id, device=img_embeds.device, dtype=torch.long)
+        bos_embeds = emb_fn(bos_ids)
+        inputs_embeds[:, :1] = bos_embeds
         for idx in range(batch_size):
             input_len = min(input_embed_list[idx].shape[1], txt_len - 1)
             # if less than txt_len, the input will be padding

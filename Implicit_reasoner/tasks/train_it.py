@@ -9,7 +9,10 @@ from os.path import join
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-import wandb
+try:
+    import wandb
+except Exception:
+    wandb = None
 
 from dataset import MetaLoader, create_dataset, create_loader, create_sampler
 from models import *
@@ -37,7 +40,7 @@ def train(
 
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", SmoothedValue(window=100, fmt="{value:.6f}"))
-    loss_names = ["loss", "loss_open_lm", "loss_mc_lm", "loss_option_ce", "loss_relation_ce", "loss_answer_verify"]
+    loss_names = ["loss", "loss_open_lm", "loss_mc_lm", "loss_option_ce", "loss_relation_ce", "loss_answer_verify", "loss_answer_align"]
 
     media_types = get_media_types(train_loaders)
 
@@ -144,7 +147,7 @@ def setup_dataloaders(config, mode="pt"):
 
 
 def main(config):
-    if is_main_process() and config.wandb.enable:
+    if is_main_process() and config.wandb.enable and wandb is not None:
         run = setup_wandb(config)
 
     logger.info(f"train_file: {config.train_file}")
@@ -176,7 +179,7 @@ def main(config):
         model_cls=model_cls,
         find_unused_parameters=True,
     )
-    if is_main_process() and config.wandb.enable:
+    if is_main_process() and config.wandb.enable and wandb is not None:
         wandb.watch(model)
 
     logger.info("Start training")
@@ -214,11 +217,8 @@ def main(config):
                 "epoch": epoch,
                 "global_step": global_step,
             }
-            torch.save(save_obj, join(config.output_dir, f"ckpt_{epoch:02d}.pth"))
-            if config.get("save_latest", False):
-                torch.save(save_obj, join(config.output_dir, "ckpt_latest.pth"))
-            if epoch in {10, 11, 22, 25}:
-                torch.save(save_obj, join(config.output_dir, f"ckpt_{epoch:02d}.pth"))
+            torch.save(save_obj, join(config.output_dir, f"ckpt_{epoch + 1}.pth"))
+            torch.save(save_obj, join(config.output_dir, "ckpt_latest.pth"))
 
         if config.evaluate:
             break
@@ -230,7 +230,7 @@ def main(config):
     logger.info(f"Training time {total_time_str}")
     logger.info(f"Checkpoints and Logs saved at {config.output_dir}")
 
-    if is_main_process() and config.wandb.enable:
+    if is_main_process() and config.wandb.enable and wandb is not None:
         run.finish()
 
 
