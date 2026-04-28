@@ -1,10 +1,19 @@
 import os
+from pathlib import Path
 from configs.instruction_data import *
 
-ROOT = "/workspace/Implicit-VideoQA"
-train_file = os.path.join(ROOT, "dataset/NExT-GQA/ICR/training_4k.json")
+ROOT = os.environ.get("IVQA_ROOT", str(Path(__file__).resolve().parents[3]))
+DATASET_ROOT = os.path.join(ROOT, "dataset")
+WEIGHTS = os.path.join(ROOT, "weights")
+VIDEO_ROOT = os.path.join(DATASET_ROOT, "video_data")
+
+train_file = os.path.join(DATASET_ROOT, "NExT-GQA/ICR/training_4k.json")
 if not os.path.exists(train_file):
-    train_file = os.path.join(ROOT, "dataset/ICR/mini_training.json")
+    train_file = os.path.join(DATASET_ROOT, "ICR/mini_training.json")
+
+available_corpus["icr_tcr"] = [train_file, VIDEO_ROOT]
+train_corpus = "icr_tcr"
+train_file = [available_corpus[train_corpus]]
 
 test_file = dict()
 test_types = []
@@ -30,9 +39,9 @@ inputs = dict(
 
 model = dict(
     model_cls="VideoChat2_it_mistral",
-    vit_blip_model_path=os.path.join(ROOT, "weights/umt_l16_qformer.pth"),
-    mistral_model_path=os.path.join(ROOT, "weights/Mistral-7B-Instruct-v0.2"),
-    videochat2_model_path=os.path.join(ROOT, "weights/videochat2_mistral_7b_stage3.pth"),
+    vit_blip_model_path=os.path.join(WEIGHTS, "umt_l16_qformer.pth"),
+    mistral_model_path=os.path.join(WEIGHTS, "Mistral-7B-Instruct-v0.2"),
+    videochat2_model_path=os.path.join(WEIGHTS, "videochat2_mistral_7b_stage3.pth"),
     freeze_vit=True,
     freeze_qformer=False,
     max_txt_len="${max_txt_l}",
@@ -40,7 +49,7 @@ model = dict(
     vision_encoder=dict(
         name="vit_l14", img_size=224, patch_size=16, d_model=1024,
         encoder_embed_dim=1024, encoder_depth=24, encoder_num_heads=16,
-        drop_path_rate=0., num_frames="${num_frames}", tubelet_size=1,
+        drop_path_rate=0.0, num_frames="${num_frames}", tubelet_size=1,
         use_checkpoint=True, checkpoint_num=18, pretrained="", return_index=-2,
         vit_add_ln=True, ckpt_num_frame=4,
     ),
@@ -57,7 +66,8 @@ model = dict(
     img_start_token="<Image>",
     img_end_token="</Image>",
     random_shuffle=True,
-    use_flash_attention=True,
+    use_clip_text_matching=False,
+    use_flash_attention=os.environ.get("DISABLE_FLASH_ATTN", "0") != "1",
     use_lora=True,
     lora_r=32,
     lora_alpha=64,
@@ -76,8 +86,14 @@ model = dict(
     num_refine_steps=1,
 )
 
-optimizer = dict(opt="adamW", lr=1.5e-5, opt_betas=[0.9, 0.999], weight_decay=0.02, max_grad_norm=1.0,
-                 different_lr=dict(enable=False, module_names=[], lr=1e-3))
+optimizer = dict(
+    opt="adamW",
+    lr=1.5e-5,
+    opt_betas=[0.9, 0.999],
+    weight_decay=0.02,
+    max_grad_norm=1.0,
+    different_lr=dict(enable=False, module_names=[], lr=1e-3),
+)
 scheduler = dict(sched="cosine", epochs=18, min_lr_multi=0.20, warmup_epochs=1.0)
 
 fp16 = True
