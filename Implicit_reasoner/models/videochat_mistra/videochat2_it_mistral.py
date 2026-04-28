@@ -1,6 +1,7 @@
 import random
 import logging
 import ast
+import json
 
 import torch
 from torch.cuda.amp import autocast as autocast
@@ -9,6 +10,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 from transformers import CLIPTokenizer, CLIPTextModel
 from ..blip2.blip2 import Blip2Base, disabled_train
 from ..icr_modules import Causal_intent_RelationHead, Vision_clue_enhancement, Vision_action_enhancement
+from ..tcr_modules import TCRMemorySelector, TCROptionClassifier, TCRAnswerVerifier, TCRContextQARetriever, mean_pool_text_embeds
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,17 @@ class VideoChat2_it_mistral(Blip2Base):
         # prompt
         max_txt_len = config.get("max_txt_len", 32)
         self.w_ce = config.get("w_ce", 3.0)
+        self.tcr_multitask = config.get("tcr_multitask", False)
+        self.tcr_topk_clues = config.get("tcr_topk_clues", 3)
+        self.tcr_clue_threshold = config.get("tcr_clue_threshold", 0.55)
+        self.w_open_lm = config.get("w_open_lm", 1.0)
+        self.w_mc_lm = config.get("w_mc_lm", 0.7)
+        self.w_option_ce = config.get("w_option_ce", 1.0)
+        self.w_relation_ce = config.get("w_relation_ce", 3.0)
+        self.w_answer_verify = config.get("w_answer_verify", 0.5)
+        self.w_answer_align = config.get("w_answer_align", 0.05)
+        self.clue_dropout_prob = config.get("clue_dropout_prob", 0.25)
+        self.no_clue_prob = config.get("no_clue_prob", 0.10)
         self.human_start = "[INST]"
         self.human_end = "[/INST]"
         self.assist_end = "</s>"
@@ -166,6 +179,10 @@ class VideoChat2_it_mistral(Blip2Base):
             self.qformer.config.hidden_size, self.mistral_model.config.hidden_size
         )
         self.max_txt_len = max_txt_len
+        self.tcr_selector = TCRMemorySelector(self.mistral_model.config.hidden_size)
+        self.option_classifier = TCROptionClassifier(self.mistral_model.config.hidden_size)
+        self.answer_verifier = TCRAnswerVerifier(self.mistral_model.config.hidden_size)
+        self.context_retriever = TCRContextQARetriever()
 
         # load weights of VideoChat2
         if videochat2_model_path:
@@ -268,7 +285,247 @@ class VideoChat2_it_mistral(Blip2Base):
     def _get_text_len(self, text):
         return self.mistral_tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids.shape[1]
 
-    def forward(self, image, text_input, instruction, gt_relation, pred_relation, action_label, intent_label, epoch):
+    def _text_embed_mean(self, texts, max_length=64):
+        if len(texts) == 0:
+            return torch.zeros(0, self.mistral_model.config.hidden_size, device=self.query_tokens.device)
+        tok = self.mistral_tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_length).to(self.query_tokens.device)
+        if self.use_lora:
+            embedder = self.mistral_model.base_model.model.model.embed_tokens
+        else:
+            embedder = self.mistral_model.model.embed_tokens
+        emb = embedder(tok.input_ids).float()
+        return mean_pool_text_embeds(emb, tok.attention_mask)
+
+    def _parse_labels(self, action_label, intent_label, n_candidates):
+        def parse(x):
+            if isinstance(x, str):
+                try:
+                    x = ast.literal_eval(x)
+                except Exception:
+                    x = []
+            if not isinstance(x, (list, tuple)):
+                x = []
+            return list(x)
+        a = parse(action_label)
+        b = parse(intent_label)
+        labels, valid = [], []
+        for i in range(n_candidates):
+            av = a[i] if i < len(a) else -1
+            bv = b[i] if i < len(b) else -1
+            if av == -1 and bv == -1:
+                labels.append(0)
+                valid.append(False)
+            else:
+                labels.append(1 if (av == 1 or bv == 1) else 0)
+                valid.append(True)
+        return torch.tensor(labels, device=self.query_tokens.device), torch.tensor(valid, device=self.query_tokens.device)
+
+    def _parse_pred_pairs(self, pred_relation):
+        pairs = []
+        for r in str(pred_relation).split('. '):
+            if ':' in r:
+                left, right = r.split(':', 1)
+                act = left.strip().lstrip('-').strip()
+                it = right.strip().rstrip('.')
+                if act or it:
+                    pairs.append((act, it))
+        return pairs
+
+    def _select_tcr_clues(self, img_embeds_single, question, options_json, pred_relation, action_label, intent_label, context_text, mode):
+        pairs = self._parse_pred_pairs(pred_relation)
+        if not pairs:
+            return [], [], torch.tensor(0.0, device=img_embeds_single.device)
+        memory_texts = [f"{a} -> {i}" for a, i in pairs]
+        mem = self._text_embed_mean(memory_texts)
+        q = self._text_embed_mean([question])[0]
+        opt = None
+        options = []
+        try:
+            options = json.loads(options_json) if options_json else []
+        except Exception:
+            options = []
+        if options:
+            opt = self._text_embed_mean([str(x) for x in options]).mean(dim=0)
+        vis = img_embeds_single.mean(dim=0)
+        logits, probs = self.tcr_selector(mem, q, opt, vis)
+        labels, valid_mask = self._parse_labels(action_label, intent_label, len(pairs))
+        if valid_mask.any():
+            relation_loss = self.CE_loss(logits[valid_mask], labels[valid_mask])
+        else:
+            relation_loss = torch.tensor(0.0, device=img_embeds_single.device)
+
+        kept = []
+        idx = torch.argsort(probs, descending=True).tolist()
+        for i in idx:
+            p = probs[i].item()
+            if p >= self.tcr_clue_threshold:
+                kept.append((pairs[i][0], pairs[i][1], p))
+            if len(kept) >= self.tcr_topk_clues:
+                break
+        if mode == 'mc' and len(kept) == 0 and len(idx) > 0 and probs[idx[0]].item() >= 0.45:
+            i = idx[0]
+            kept.append((pairs[i][0], pairs[i][1], probs[i].item()))
+
+        ctx_lines = []
+        if context_text:
+            pieces = [x.strip() for x in context_text.replace('Context QA memory:', '').split(';') if x.strip()]
+            ctx_lines = self.context_retriever.rank(question, pieces, topk=2)
+        return kept, ctx_lines, relation_loss
+
+    def _build_tcr_memory_prompt(self, selected_pairs, selected_context_lines):
+        lines = ["Relevant context memory:"]
+        for a, i, _ in selected_pairs:
+            lines.append(f"- Action: {a} Intent: {i}")
+        for c in selected_context_lines:
+            lines.append(f"- Context QA: {c}")
+        text = "\n".join(lines)
+        w = text.split()
+        if len(w) > 220:
+            text = ' '.join(w[:220])
+        return text
+
+    def _inject_memory_prompt(self, prompt, mem_prompt):
+        if not mem_prompt or self.human_start not in prompt:
+            return prompt
+        return prompt.replace(self.human_start + ' ', self.human_start + ' ' + mem_prompt + "\n", 1)
+
+    def _lm_loss_for_prompts(self, img_embeds, prompts, use_image):
+        if len(prompts) == 0:
+            return torch.tensor(0.0, device=img_embeds.device)
+        loss = self.forward_legacy_with_embeds(img_embeds, prompts, use_image)
+        return loss
+
+    def forward_legacy_with_embeds(self, img_embeds, text_input, use_image):
+        batch_size, img_len, _ = img_embeds.shape
+        max_len = 0
+        input_embed_list, p_before_len_list, target_list = [], [], []
+        for idx, prompt in enumerate(text_input):
+            tmp_img_embeds = img_embeds[idx].unsqueeze(0)
+            end_token = self.img_end_token if use_image else self.end_token
+            p_before, p_after = prompt.split(end_token)
+            p_after = end_token + p_after
+            p_before_tokens = self.mistral_tokenizer(p_before, return_tensors='pt', add_special_tokens=False).to(tmp_img_embeds.device)
+            p_after_tokens = self.mistral_tokenizer(p_after, return_tensors='pt', add_special_tokens=False).to(tmp_img_embeds.device)
+            emb_fn = self.mistral_model.base_model.model.model.embed_tokens if self.use_lora else self.mistral_model.model.embed_tokens
+            p_before_embeds = emb_fn(p_before_tokens.input_ids)
+            p_after_embeds = emb_fn(p_after_tokens.input_ids)
+            input_embeds = torch.cat([p_before_embeds, tmp_img_embeds, p_after_embeds], dim=1)
+            sep1 = self.human_start + ' '
+            sep2 = ' ' + self.human_end + ' '
+            raw_text = p_after.split(sep2)
+            for j in range(0, len(raw_text)-1):
+                raw_text[j] = raw_text[j] + sep2
+            answer_targets = p_after_tokens.input_ids.clone()
+            cur_len = self._get_text_len(raw_text[0].rstrip())
+            answer_targets[:, :cur_len] = -100
+            for text in raw_text[1:-1]:
+                total_len = self._get_text_len(text.rstrip())
+                ans_len = self._get_text_len((text.split(sep1)[0]).rstrip())
+                answer_targets[:, (cur_len + ans_len):(cur_len + total_len)] = -100
+                cur_len += total_len
+            cur_len += self._get_text_len(raw_text[-1].rstrip())
+            max_len = max(max_len, input_embeds.shape[1])
+            input_embed_list.append(input_embeds)
+            p_before_len_list.append(p_before_tokens.input_ids.shape[1])
+            target_list.append(answer_targets)
+        txt_len = min(max_len + 1, self.max_txt_len + img_len)
+        inp = torch.ones([batch_size, txt_len], dtype=torch.long, device=img_embeds.device) * self.mistral_tokenizer.pad_token_id
+        emb_fn = self.mistral_model.base_model.model.model.embed_tokens if self.use_lora else self.mistral_model.model.embed_tokens
+        inputs_embeds = emb_fn(inp)
+        attention_mask = torch.zeros([batch_size, txt_len], dtype=torch.long, device=img_embeds.device)
+        targets = torch.ones([batch_size, txt_len], dtype=torch.long, device=img_embeds.device).fill_(-100)
+        inputs_embeds[:, :1] = self.mistral_tokenizer.bos_token_id
+        for idx in range(batch_size):
+            input_len = min(input_embed_list[idx].shape[1], txt_len - 1)
+            inputs_embeds[idx, 1:(input_len+1)] = input_embed_list[idx][:, :input_len]
+            attention_mask[idx, :(input_len+1)] = 1
+            p_before_len = p_before_len_list[idx]
+            targets[idx, (p_before_len + img_len + 1):(input_len + 1)] = target_list[idx][0, :(input_len - p_before_len - img_len)]
+        outputs = self.mistral_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True, labels=targets, use_cache=False)
+        return outputs.loss
+
+    def _option_classification_loss(self, img_embeds, raw_questions, options_jsons, answer_letters):
+        losses = []
+        for i, q in enumerate(raw_questions):
+            try:
+                options = json.loads(options_jsons[i]) if options_jsons[i] else []
+            except Exception:
+                options = []
+            if not options:
+                continue
+            letter = (answer_letters[i] or '').strip().upper()
+            if letter not in ['A','B','C','D','E']:
+                continue
+            target = ord(letter)-ord('A')
+            if target >= len(options):
+                continue
+            q_emb = self._text_embed_mean([q])[0]
+            o_emb = self._text_embed_mean([str(x) for x in options])
+            v_emb = img_embeds[i].mean(dim=0)
+            logits = self.option_classifier(v_emb, q_emb, o_emb)
+            losses.append(self.CE_loss(logits.unsqueeze(0), torch.tensor([target], device=img_embeds.device)))
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=img_embeds.device)
+
+    def _answer_verifier_loss(self, img_embeds, raw_questions, rich_open_answers, options_jsons, answer_letters):
+        losses = []
+        b = len(raw_questions)
+        for i in range(b):
+            pos = (rich_open_answers[i] or '').strip()
+            if not pos:
+                continue
+            cands = [pos]
+            try:
+                opts = json.loads(options_jsons[i]) if options_jsons and options_jsons[i] else []
+            except Exception:
+                opts = []
+            letter = (answer_letters[i] or '').strip().upper()
+            gt_idx = ord(letter)-ord('A') if letter in ['A','B','C','D','E'] else -1
+            for j, o in enumerate(opts):
+                if j != gt_idx:
+                    cands.append(str(o))
+            if b > 1:
+                cands.append(rich_open_answers[(i+1) % b])
+            q_emb = self._text_embed_mean([raw_questions[i]])[0]
+            v_emb = img_embeds[i].mean(dim=0)
+            a_emb = self._text_embed_mean(cands)
+            logits = torch.stack([self.answer_verifier(v_emb, q_emb, a_emb[k]) for k in range(a_emb.shape[0])])
+            losses.append(self.CE_loss(logits.unsqueeze(0), torch.tensor([0], device=img_embeds.device)))
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=img_embeds.device)
+
+    def _forward_tcr(self, image, text_input, instruction, gt_relation, pred_relation, action_label, intent_label, epoch,
+                     mc_text_input=None, options_json=None, answer_letter=None, context_text=None, raw_question=None,
+                     rich_open_answer=None, sampled_seconds=None):
+        img_embeds, use_image = self.encode_img(image, instruction)
+        open_prompts = list(text_input)
+        mc_prompts = list(mc_text_input) if mc_text_input is not None else []
+        rel_losses = []
+        for i in range(len(open_prompts)):
+            q = raw_question[i] if raw_question else ''
+            oj = options_json[i] if options_json else '[]'
+            ctx = context_text[i] if context_text else ''
+            sp, sc, rl = self._select_tcr_clues(img_embeds[i], q, oj, pred_relation[i], action_label[i], intent_label[i], ctx, mode='open')
+            mem = self._build_tcr_memory_prompt(sp, sc)
+            open_prompts[i] = self._inject_memory_prompt(open_prompts[i], mem)
+            rel_losses.append(rl)
+            if i < len(mc_prompts) and mc_prompts[i]:
+                sp2, sc2, rl2 = self._select_tcr_clues(img_embeds[i], q, oj, pred_relation[i], action_label[i], intent_label[i], ctx, mode='mc')
+                mem2 = self._build_tcr_memory_prompt(sp2, sc2)
+                mc_prompts[i] = self._inject_memory_prompt(mc_prompts[i], mem2)
+                rel_losses.append(rl2)
+
+        loss_open_lm = self._lm_loss_for_prompts(img_embeds, open_prompts, use_image)
+        loss_mc_lm = self._lm_loss_for_prompts(img_embeds, [p for p in mc_prompts if p], use_image) if mc_prompts else torch.tensor(0.0, device=img_embeds.device)
+        loss_option_ce = self._option_classification_loss(img_embeds, raw_question or ['']*len(open_prompts), options_json or ['[]']*len(open_prompts), answer_letter or ['']*len(open_prompts))
+        loss_relation_ce = torch.stack(rel_losses).mean() if rel_losses else torch.tensor(0.0, device=img_embeds.device)
+        loss_answer_verify = self._answer_verifier_loss(img_embeds, raw_question or ['']*len(open_prompts), rich_open_answer or ['']*len(open_prompts), options_json or ['[]']*len(open_prompts), answer_letter or ['']*len(open_prompts))
+        relation_weight = max(0.5, self.w_relation_ce - 0.09 * epoch)
+        loss = self.w_open_lm*loss_open_lm + self.w_mc_lm*loss_mc_lm + self.w_option_ce*loss_option_ce + relation_weight*loss_relation_ce + self.w_answer_verify*loss_answer_verify
+        return dict(loss=loss, loss_open_lm=loss_open_lm, loss_mc_lm=loss_mc_lm, loss_option_ce=loss_option_ce, loss_relation_ce=loss_relation_ce, loss_answer_verify=loss_answer_verify)
+
+    def forward(self, image, text_input, instruction, gt_relation, pred_relation, action_label, intent_label, epoch, mc_text_input=None, options_json=None, answer_letter=None, context_text=None, raw_question=None, rich_open_answer=None, sampled_seconds=None):
+        if self.tcr_multitask:
+            return self._forward_tcr(image, text_input, instruction, gt_relation, pred_relation, action_label, intent_label, epoch, mc_text_input=mc_text_input, options_json=options_json, answer_letter=answer_letter, context_text=context_text, raw_question=raw_question, rich_open_answer=rich_open_answer, sampled_seconds=sampled_seconds)
+
         global action_list, intent_list, loss_ce
         img_embeds, use_image = self.encode_img(image, instruction)
         batch_size, img_len, _ = img_embeds.shape
@@ -535,6 +792,13 @@ class VideoChat2_it_mistral(Blip2Base):
                 use_cache=False,  # current flash_attn2 dows not support padding=right for mistral
             )
 
+        relation_weight = max(0.5, self.w_ce - 0.09 * epoch)
+        total = outputs.loss + relation_weight * loss_ce
         return dict(
-            loss=outputs.loss + (self.w_ce - 0.09 * epoch) * loss_ce,
+            loss=total,
+            loss_open_lm=outputs.loss,
+            loss_mc_lm=torch.tensor(0.0, device=outputs.loss.device),
+            loss_option_ce=torch.tensor(0.0, device=outputs.loss.device),
+            loss_relation_ce=loss_ce if isinstance(loss_ce, torch.Tensor) else torch.tensor(float(loss_ce), device=outputs.loss.device),
+            loss_answer_verify=torch.tensor(0.0, device=outputs.loss.device),
         )
