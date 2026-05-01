@@ -77,8 +77,43 @@ def _deterministic_pick(indices, k):
     return out
 
 
+def _pad_or_trim(indices, k):
+    if not indices:
+        return []
+    out = list(indices[:k])
+    while len(out) < k:
+        out.append(out[len(out) % len(out)])
+    return out[:k]
+
+
+def _sample_boundary_indices(legal_indices, ts, mask, k):
+    if mask is None:
+        return _deterministic_pick(legal_indices, k)
+    start, end = mask
+    before = [i for i in legal_indices if ts[i] < start]
+    after = [i for i in legal_indices if ts[i] > end]
+    half = max(1, k // 2)
+    chosen = before[-half:] + after[: max(0, k - half)]
+    if len(chosen) < k:
+        used = set(chosen)
+        fallback = [i for i in legal_indices if i not in used]
+        chosen.extend(_deterministic_pick(fallback, k - len(chosen)))
+    return sorted(_pad_or_trim(chosen, k))
+
+
+def _sample_query_indices(legal_indices, k, seed=None):
+    if not legal_indices:
+        return []
+    rnd = random.Random(seed if seed is not None else 0)
+    pool = list(legal_indices)
+    rnd.shuffle(pool)
+    if len(pool) >= k:
+        return sorted(pool[:k])
+    return sorted(_pad_or_trim(pool, k))
+
+
 def sample_tcr_frame_indices(vr, num_frames, question, mask_duration=None, all_duration=None, mode="tcr", seed=None):
-    del question, all_duration, mode  # reserved for future adaptive policies
+    del question, all_duration  # question-aware policies can be added later
     if num_frames <= 0:
         return [], []
     ts = _timestamps(vr)
@@ -90,13 +125,14 @@ def sample_tcr_frame_indices(vr, num_frames, question, mask_duration=None, all_d
     if not legal_indices:
         raise RuntimeError(f"No legal non-evidence frame exists for mask_duration={mask_duration}")
 
-    if seed is not None:
-        rnd = random.Random(seed)
-        shuffled = list(legal_indices)
-        rnd.shuffle(shuffled)
-        chosen = _deterministic_pick(sorted(shuffled), num_frames)
+    mode = (mode or "global").lower()
+    if mode == "boundary":
+        chosen = _sample_boundary_indices(legal_indices, ts, mask, num_frames)
+    elif mode == "query":
+        chosen = _sample_query_indices(legal_indices, num_frames, seed=seed)
     else:
         chosen = _deterministic_pick(legal_indices, num_frames)
+    chosen = sorted(chosen)
 
     seconds = [round(ts[i], 3) for i in chosen]
     assert_no_duration_leak(seconds, mask_duration)

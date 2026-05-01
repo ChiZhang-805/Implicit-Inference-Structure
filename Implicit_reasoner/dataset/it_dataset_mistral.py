@@ -150,24 +150,20 @@ class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
         return " ".join(words[:300]) if len(words) > 300 else text
 
     def expand_open_answer(self, question, short_answer, correct_option_text):
-        q = (question or "").strip().lower()
-        base = (correct_option_text or "").strip() or (short_answer or "").strip()
+        # Open-ended supervision must stay on the original dataset answer.
+        # Do NOT replace it with the correct MC option text: that makes the
+        # decoder learn an option-style answer distribution and hurts GPT-based
+        # open-ended evaluation.
+        del question, correct_option_text
+        base = (short_answer or "").strip()
         if not base:
             return ""
         if not base.endswith("."):
             base = base + "."
-        if len(base.split()) >= 5:
-            return base
-        if q.startswith("why") or "reason" in q:
-            return f"The reason is that {base[:-1]}."
-        if q.startswith("how"):
-            return f"It is done by {base[:-1]}."
-        if q.startswith("what"):
-            return f"The most likely result is that {base[:-1]}."
         return base
 
     def build_open_conversation(self, question, rich_open_answer, context_text, msg):
-        payload = "The explicit evidence is hidden. Answer in one complete sentence using context QA memory and visual clues."
+        payload = "The explicit evidence is hidden. Answer the question directly and concisely using context QA memory and visual clues."
         if context_text:
             payload += f"\n{context_text}"
         payload += f"\nQuestion: {question}"
@@ -230,7 +226,8 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
     def load_and_transform_tcr_video(self, index, video_path, question, mask_duration, all_duration, view="query"):
         del all_duration
         vr = VideoReader(video_path, num_threads=1)
-        seed = (index * 997 + hash(view) % 991) & 0xFFFFFFFF
+        view_seed = {"query": 17, "global": 31, "boundary": 47}.get(str(view), 59)
+        seed = (index * 997 + view_seed) & 0xFFFFFFFF
         frame_indices, seconds = sample_tcr_frame_indices(vr, self.num_frames, question, mask_duration=mask_duration, mode=view, seed=seed)
         frames = vr.get_batch(frame_indices).permute(0, 3, 1, 2)
         if self.dynamic_config:

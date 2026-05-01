@@ -14,6 +14,7 @@ from models.videochat_mistra.videochat2_it_mistral import VideoChat2_it_mistral
 from dataset.tcr_video_sampling import sample_tcr_multi_views
 
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi")
+PREFERRED_OPEN_VIEW_ORDER = ["boundary", "query", "global"]
 
 
 def parse_args():
@@ -75,6 +76,25 @@ def clean_candidate(text):
     return t
 
 
+def build_context_text(sample):
+    context = sample.get("context", {}).get("context_question", "")
+    if isinstance(context, dict):
+        return "; ".join([
+            f"Q:{v.get('question', '')} A:{v.get('answer', '')}"
+            for v in context.values()
+            if isinstance(v, dict)
+        ])
+    if isinstance(context, list):
+        lines = []
+        for v in context:
+            if isinstance(v, dict):
+                lines.append(f"Q:{v.get('question', '')} A:{v.get('answer', '')}")
+            elif isinstance(v, str):
+                lines.append(v)
+        return "; ".join([x for x in lines if x.strip()])
+    return str(context) if context else ""
+
+
 def main():
     args = parse_args()
     cfg = Config.from_file(args.config)
@@ -86,11 +106,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device).eval()
 
-    prompts = {
-        "direct": "Answer the question in one complete sentence. State the most likely action, reason, or result. Do not mention options.",
-        "causal": "Explain the most likely reason or outcome using the visual context. Use one complete sentence.",
-        "temporal": "Pay attention to what happens before and after the hidden evidence. Answer in one complete sentence.",
-    }
+    prompt_instruction = "Please answer the question directly and concisely. Do not mention options."
 
     data = json.load(open(args.inference_file))
     if args.limit:
@@ -105,18 +121,23 @@ def main():
         video_id = sample.get("video_id", qa.get("video_id"))
         path = resolve_video(video_id, vindex)
         pred_relation = sample.get("action_relation_intent", "")
-        context = sample.get("context", {}).get("context_question", "")
-        context_text = ""
-        if isinstance(context, dict):
-            context_text = "; ".join([f"Q:{v.get('question','')} A:{v.get('answer','')}" for v in context.values() if isinstance(v, dict)])
+        context_text = build_context_text(sample)
 
         vr = VideoReader(path, num_threads=1)
-        sampled = sample_tcr_multi_views(vr, args.num_frames, q, mask_duration=sample.get("duration"), all_duration=sample.get("all_duration"))
+        sampled = sample_tcr_multi_views(
+            vr,
+            args.num_frames,
+            q,
+            mask_duration=sample.get("duration"),
+            all_duration=sample.get("all_duration"),
+        )
 
         all_candidates, frame_diag = [], {}
         clue_diag, ctx_diag = {}, {}
         with torch.no_grad():
             for v in views:
+                if v not in sampled:
+                    continue
                 idxs = sampled[v]["indices"]
                 secs = [float(s) for s in sampled[v]["seconds"]]
                 frame_diag[v] = secs
@@ -128,51 +149,34 @@ def main():
                 clue_diag[v] = selected_clues
                 ctx_diag[v] = selected_ctx
                 mem = model._build_tcr_memory_prompt(selected_clues, selected_ctx)
-                prefix = f"{model.human_start} {model.start_token}{model.end_token} {model.human_end} {model.human_start} {mem}\nQuestion: {q}\n"
+                mem_block = f"{mem}\n" if mem else ""
+                prefix = (
+                    f"{model.human_start} {model.start_token}{model.end_token} {model.human_end} "
+                    f"{model.human_start} {mem_block}Question: {q}\n"
+                )
+                prompt = prefix + prompt_instruction + f" {model.human_end}"
+                gen_embeds = model.build_tcr_generation_embeds(img_embeds, prompt, use_image)
+                attn = torch.ones(gen_embeds.shape[:2], dtype=torch.long, device=device)
+                out = model.mistral_model.generate(
+                    inputs_embeds=gen_embeds,
+                    attention_mask=attn,
+                    max_new_tokens=96,
+                    num_beams=1,
+                    do_sample=False,
+                    pad_token_id=model.mistral_tokenizer.eos_token_id,
+                )
+                text = model.mistral_tokenizer.decode(out[0], skip_special_tokens=True)
+                all_candidates.append((v, "open", clean_candidate(text), img_embeds[0], q, selected_clues))
 
-                for k, instr in prompts.items():
-                    prompt = prefix + instr + f" {model.human_end}"
-                    gen_embeds = model.build_tcr_generation_embeds(img_embeds, prompt, use_image)
-                    attn = torch.ones(gen_embeds.shape[:2], dtype=torch.long, device=device)
-                    out = model.mistral_model.generate(
-                        inputs_embeds=gen_embeds,
-                        attention_mask=attn,
-                        max_new_tokens=96,
-                        num_beams=1,
-                        do_sample=False,
-                    )
-                    text = model.mistral_tokenizer.decode(out[0], skip_special_tokens=True)
-                    all_candidates.append((v, k, clean_candidate(text), img_embeds[0], q, selected_clues))
-
-                    out2 = model.mistral_model.generate(
-                        inputs_embeds=gen_embeds,
-                        attention_mask=attn,
-                        max_new_tokens=96,
-                        num_beams=1,
-                        do_sample=True,
-                        temperature=0.2,
-                        top_p=0.9,
-                    )
-                    text2 = model.mistral_tokenizer.decode(out2[0], skip_special_tokens=True)
-                    all_candidates.append((v, f"{k}_sample", clean_candidate(text2), img_embeds[0], q, selected_clues))
-
-        candidates = [c[2] for c in all_candidates if c[2]]
+        candidates = [c for c in all_candidates if c[2]]
         if not candidates:
-            pred = "The most likely result is that the visible context suggests an implied event."
+            pred = "The visible context suggests an implied event."
         else:
-            verifier_scores = []
-            for _, _, cand, emb, question, clues in all_candidates:
-                if not cand:
-                    verifier_scores.append(-1e6)
-                    continue
-                vscore = float(model.verify_open_candidates(emb, question, [cand])[0].detach().item())
-                lmscore = -float(model.score_option_likelihood(emb.unsqueeze(0), f"{question}", [cand], use_image=False)[0])
-                n_words = len(cand.split())
-                len_bonus = 1.0 if 8 <= n_words <= 25 else 0.0
-                clue_bonus = 0.2 if clues else 0.0
-                verifier_scores.append(vscore + 0.3 * lmscore + len_bonus + clue_bonus)
-            best_idx = int(torch.tensor(verifier_scores).argmax().item())
-            pred = all_candidates[best_idx][2]
+            ordered = []
+            for view_name in PREFERRED_OPEN_VIEW_ORDER:
+                ordered.extend([c for c in candidates if c[0] == view_name])
+            ordered.extend([c for c in candidates if c not in ordered])
+            pred = ordered[0][2]
 
         if len(pred.split()) < 5:
             ql = q.lower()
@@ -181,10 +185,10 @@ def main():
             elif ql.startswith("how"):
                 pred = f"It is done by {pred.rstrip('.')} .".replace("  ", " ")
             else:
-                pred = f"The most likely result is that {pred.rstrip('.')} .".replace("  ", " ")
+                pred = f"The likely answer is that {pred.rstrip('.')} .".replace("  ", " ")
             pred = pred.replace(" .", ".")
 
-        out = {
+        out_item = {
             "question_id": sample.get("question_id", qa.get("question_id", "")),
             "video_id": video_id,
             "question": q,
@@ -197,10 +201,12 @@ def main():
         }
         if not args.diagnostics:
             for k in ["selected_clues", "selected_context", "frame_seconds_by_view", "candidate_preds"]:
-                out.pop(k)
-        outs.append(out)
+                out_item.pop(k)
+        outs.append(out_item)
 
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    out_dir = os.path.dirname(args.output_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     json.dump(outs, open(args.output_file, "w"), indent=2)
     print(f"Saved {len(outs)} outputs -> {args.output_file}")
 
