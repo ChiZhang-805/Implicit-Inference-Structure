@@ -9,7 +9,10 @@ VIDEO_ROOT = os.path.join(DATASET_ROOT, "video_data")
 
 train_file = os.path.join(DATASET_ROOT, "NExT-GQA/ICR/training_4k.json")
 if not os.path.exists(train_file):
-    train_file = os.path.join(DATASET_ROOT, "ICR/mini_training.json")
+    if os.environ.get("IVQA_ALLOW_MINI_FALLBACK", "0") == "1":
+        train_file = os.path.join(DATASET_ROOT, "ICR/mini_training.json")
+    else:
+        raise FileNotFoundError(f"Missing training file: {train_file}. Set IVQA_ALLOW_MINI_FALLBACK=1 only for debugging.")
 
 available_corpus["icr_tcr"] = [train_file, VIDEO_ROOT]
 train_corpus = "icr_tcr"
@@ -73,14 +76,19 @@ model = dict(
     lora_alpha=64,
     lora_dropout=0.05,
     tcr_multitask=True,
-    tcr_topk_clues=3,
-    tcr_clue_threshold=0.55,
+    tcr_topk_clues=3,              # backward-compatible MC default
+    tcr_topk_clues_open=1,
+    tcr_topk_clues_mc=3,
+    tcr_clue_threshold_open=0.68,
+    tcr_clue_threshold_mc=0.55,
     w_open_lm=1.0,
-    w_mc_lm=0.7,
-    w_option_ce=1.0,
-    w_relation_ce=3.0,
-    w_answer_verify=0.5,
-    w_answer_align=0.05,
+    # Open-first schedule. Re-enable stronger MC auxiliary weights only after
+    # open-ended accuracy recovers near the original baseline.
+    w_mc_lm=0.2,
+    w_option_ce=0.2,
+    w_relation_ce=0.5,
+    w_answer_verify=0.05,
+    w_answer_align=0.0,
     clue_dropout_prob=0.25,
     no_clue_prob=0.10,
     num_refine_steps=1,

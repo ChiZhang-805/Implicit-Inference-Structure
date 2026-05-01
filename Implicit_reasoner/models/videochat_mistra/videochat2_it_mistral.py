@@ -43,8 +43,15 @@ class VideoChat2_it_mistral(Blip2Base):
         max_txt_len = config.get("max_txt_len", 32)
         self.w_ce = config.get("w_ce", 3.0)
         self.tcr_multitask = config.get("tcr_multitask", False)
-        self.tcr_topk_clues = config.get("tcr_topk_clues", 3)
-        self.tcr_clue_threshold = config.get("tcr_clue_threshold", 0.55)
+        # Use conservative clue injection for open-ended generation. A wrong
+        # clue is much more damaging for free-form generation than for MC
+        # scoring, where option likelihood/classifier can still recover.
+        self.tcr_topk_clues_open = int(config.get("tcr_topk_clues_open", 1))
+        self.tcr_topk_clues_mc = int(config.get("tcr_topk_clues_mc", config.get("tcr_topk_clues", 3)))
+        self.tcr_clue_threshold_open = float(config.get("tcr_clue_threshold_open", 0.68))
+        self.tcr_clue_threshold_mc = float(config.get("tcr_clue_threshold_mc", config.get("tcr_clue_threshold", 0.55)))
+        self.tcr_topk_clues = self.tcr_topk_clues_mc
+        self.tcr_clue_threshold = self.tcr_clue_threshold_mc
         self.w_open_lm = config.get("w_open_lm", 1.0)
         self.w_mc_lm = config.get("w_mc_lm", 0.7)
         self.w_option_ce = config.get("w_option_ce", 1.0)
@@ -370,11 +377,13 @@ class VideoChat2_it_mistral(Blip2Base):
 
         kept = []
         idx = torch.argsort(probs, descending=True).tolist()
+        topk = self.tcr_topk_clues_mc if mode == 'mc' else self.tcr_topk_clues_open
+        threshold = self.tcr_clue_threshold_mc if mode == 'mc' else self.tcr_clue_threshold_open
         for i in idx:
             p = probs[i].item()
-            if p >= self.tcr_clue_threshold:
+            if p >= threshold:
                 kept.append((pairs[i][0], pairs[i][1], p))
-            if len(kept) >= self.tcr_topk_clues:
+            if len(kept) >= topk:
                 break
         if mode == 'mc' and len(kept) == 0 and len(idx) > 0 and probs[idx[0]].item() >= 0.45:
             i = idx[0]
@@ -387,6 +396,8 @@ class VideoChat2_it_mistral(Blip2Base):
         return kept, ctx_lines, relation_loss
 
     def _build_tcr_memory_prompt(self, selected_pairs, selected_context_lines):
+        if not selected_pairs and not selected_context_lines:
+            return ""
         lines = ["Relevant context memory:"]
         for a, i, _ in selected_pairs:
             lines.append(f"- Action: {a} Intent: {i}")
@@ -594,7 +605,11 @@ class VideoChat2_it_mistral(Blip2Base):
             q = raw_question[i] if raw_question else ''
             oj = options_json[i] if options_json else '[]'
             ctx = context_text[i] if context_text else ''
-            sp, sc, rl = self._select_tcr_clues(img_embeds[i], q, oj, pred_relation[i], action_label[i], intent_label[i], ctx, mode='open')
+            # Open-ended generation should not condition clue selection on MC
+            # options. Option-aware clues are kept for MC only.
+            sp, sc, rl = self._select_tcr_clues(
+                img_embeds[i], q, '[]', pred_relation[i], action_label[i], intent_label[i], ctx, mode='open'
+            )
             mem = self._build_tcr_memory_prompt(sp, sc)
             open_prompts[i] = self._inject_memory_prompt(open_prompts[i], mem)
             rel_losses.append(rl)
