@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import tempfile
+import types
 from copy import deepcopy
 from importlib import import_module
 
@@ -64,7 +65,7 @@ class Config(object):
         """
         if savepath is None:
             savepath = osp.join(cfg.WORKSPACE, "config.json")
-        json.dump(cfg, open(savepath, "w"), indent=2)
+        json.dump(cfg, open(savepath, "w"), indent=2, default=str)
 
     @classmethod
     def get_config(cls, default_config: dict = None):
@@ -130,7 +131,11 @@ class Config(object):
                 cfg_dict = {
                     name: value
                     for name, value in mod.__dict__.items()
-                    if not name.startswith("__")
+                    if (
+                        not name.startswith("__")
+                        and not isinstance(value, types.ModuleType)
+                        and not callable(value)
+                    )
                 }
                 for k in list(sys.modules.keys()):
                     if "tmp_config" in k:

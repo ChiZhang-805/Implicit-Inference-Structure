@@ -7,6 +7,7 @@
 import contextlib
 import os
 import logging
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -23,8 +24,26 @@ class Blip2Base(nn.Module):
         super().__init__()
 
     @classmethod
+    def _local_bert_path(cls):
+        root = Path(os.environ.get("IVQA_ROOT", str(Path(__file__).resolve().parents[3])))
+        candidates = [
+            root / "weights" / "bert-base-uncased",
+            Path("/workspace/weights/bert-base-uncased"),
+            Path.cwd() / "bert-base-uncased",
+        ]
+        for candidate in candidates:
+            if candidate.is_dir():
+                return str(candidate)
+        return "bert-base-uncased"
+
+    @classmethod
     def init_tokenizer(cls, truncation_side="right"):
-        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", truncation_side=truncation_side, local_files_only=True)
+        bert_path = cls._local_bert_path()
+        tokenizer = BertTokenizer.from_pretrained(
+            bert_path,
+            truncation_side=truncation_side,
+            local_files_only=True,
+        )
         tokenizer.add_special_tokens({"bos_token": "[DEC]"})
         return tokenizer
     
@@ -50,7 +69,7 @@ class Blip2Base(nn.Module):
         qformer_attention_probs_dropout_prob=0.1,
         qformer_drop_path_rate=0.,
     ):
-        encoder_config = BertConfig.from_pretrained("bert-base-uncased", local_files_only=True)
+        encoder_config = BertConfig.from_pretrained(cls._local_bert_path(), local_files_only=True)
         encoder_config.encoder_width = vision_width
         # insert cross-attention layer every other block
         encoder_config.add_cross_attention = True

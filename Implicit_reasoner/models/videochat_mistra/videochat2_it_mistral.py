@@ -620,7 +620,16 @@ class VideoChat2_it_mistral(Blip2Base):
                 rel_losses.append(rl2)
 
         loss_open_lm = self._lm_loss_for_prompts(img_embeds, open_prompts, use_image)
-        loss_mc_lm = self._lm_loss_for_prompts(img_embeds, [p for p in mc_prompts if p], use_image) if mc_prompts else torch.tensor(0.0, device=img_embeds.device)
+        if mc_prompts:
+            mc_indices = [idx for idx, p in enumerate(mc_prompts) if p]
+            if mc_indices:
+                mc_img_embeds = img_embeds[mc_indices]
+                mc_prompt_list = [mc_prompts[idx] for idx in mc_indices]
+                loss_mc_lm = self._lm_loss_for_prompts(mc_img_embeds, mc_prompt_list, use_image)
+            else:
+                loss_mc_lm = torch.tensor(0.0, device=img_embeds.device)
+        else:
+            loss_mc_lm = torch.tensor(0.0, device=img_embeds.device)
         loss_option_ce = self._option_classification_loss(img_embeds, raw_question or ['']*len(open_prompts), options_json or ['[]']*len(open_prompts), answer_letter or ['']*len(open_prompts))
         loss_relation_ce = torch.stack(rel_losses).mean() if rel_losses else torch.tensor(0.0, device=img_embeds.device)
         loss_answer_verify = self._answer_verifier_loss(img_embeds, raw_question or ['']*len(open_prompts), rich_open_answer or ['']*len(open_prompts), options_json or ['[]']*len(open_prompts), answer_letter or ['']*len(open_prompts))

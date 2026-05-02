@@ -82,7 +82,7 @@ def _pad_or_trim(indices, k):
         return []
     out = list(indices[:k])
     while len(out) < k:
-        out.append(out[len(out) % len(out)])
+        out.append(indices[len(out) % len(indices)])
     return out[:k]
 
 
@@ -135,7 +135,7 @@ def sample_tcr_frame_indices(vr, num_frames, question, mask_duration=None, all_d
     chosen = sorted(chosen)
 
     seconds = [round(ts[i], 3) for i in chosen]
-    assert_no_duration_leak(seconds, mask_duration)
+    assert_no_duration_leak(seconds, mask_duration, eps=0.0)
     return chosen, seconds
 
 
@@ -151,11 +151,11 @@ def sample_tcr_multi_views(vr, num_frames, question, mask_duration=None, all_dur
     }
 
 
-def assert_no_duration_leak(seconds, duration):
+def assert_no_duration_leak(seconds, duration, eps=0.0):
     mask = parse_duration(duration)
     if mask is None:
         return True
-    leaked = [float(s) for s in seconds if is_inside_mask(float(s), mask)]
+    leaked = [float(s) for s in seconds if is_inside_mask(float(s), mask, eps=eps)]
     if leaked:
         raise RuntimeError(f"Duration leak detected. mask={mask}, leaked_seconds={leaked}")
     return True

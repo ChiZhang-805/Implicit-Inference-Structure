@@ -24,7 +24,7 @@ num_workers = 4
 num_frames = 8
 num_frames_test = 8
 batch_size = 2
-max_txt_l = 768
+max_txt_l = 512
 
 inputs = dict(
     image_res=224,
@@ -72,8 +72,8 @@ model = dict(
     use_clip_text_matching=False,
     use_flash_attention=os.environ.get("DISABLE_FLASH_ATTN", "0") != "1",
     use_lora=True,
-    lora_r=32,
-    lora_alpha=64,
+    lora_r=16,
+    lora_alpha=32,
     lora_dropout=0.05,
     tcr_multitask=True,
     tcr_topk_clues=3,              # backward-compatible MC default

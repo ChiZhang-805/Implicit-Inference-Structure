@@ -1,9 +1,11 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 from decord import VideoReader
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
@@ -27,6 +29,8 @@ def parse_args():
     p.add_argument("--views", default="global,boundary,query")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--diagnostics", action="store_true")
+    p.add_argument("--no_text_nll", action="store_true", help="Skip option-text likelihood scoring for faster MC inference.")
+    p.add_argument("--save_every", type=int, default=20, help="Incrementally save predictions every N samples.")
     return p.parse_args()
 
 
@@ -111,7 +115,8 @@ def main():
     video_index = build_video_index(args.video_root)
 
     results = []
-    for sample in data:
+    t0 = time.time()
+    for sample_idx, sample in enumerate(tqdm(data, desc="MC inference")):
         qa, options, answer = parse_options(sample)
         q = qa.get("question", sample.get("question", ""))
         video_id = sample.get("video_id", qa.get("video_id"))
@@ -154,13 +159,19 @@ def main():
                 letter_targets = [f"The answer is ({LETTERS[i]}). {model.assist_end}" for i in range(len(options))]
                 text_targets = [f"({LETTERS[i]}) {options[i]} {model.assist_end}" for i in range(len(options))]
                 letter_nll = model.score_option_likelihood(img_embeds, prompt_prefix, letter_targets, use_image)
-                text_nll = model.score_option_likelihood(img_embeds, prompt_prefix, text_targets, use_image)
+                if args.no_text_nll:
+                    text_nll = [0.0 for _ in range(len(options))]
+                else:
+                    text_nll = model.score_option_likelihood(img_embeds, prompt_prefix, text_targets, use_image)
                 cls_logits = model.score_options_classifier(img_embeds[0], q, options).detach().float().cpu()
 
                 ln = normalize_scores(letter_nll)
                 tn = normalize_scores(text_nll)
                 cn = normalize_scores(cls_logits.tolist())
-                final = 0.45 * (-ln) + 0.25 * (-tn) + 0.30 * cn
+                if args.no_text_nll:
+                    final = 0.60 * (-ln) + 0.40 * cn
+                else:
+                    final = 0.45 * (-ln) + 0.25 * (-tn) + 0.30 * cn
                 agg += final
                 option_diag[v] = {LETTERS[i]: float(final[i].item()) for i in range(len(options))}
 
@@ -184,8 +195,17 @@ def main():
             out.pop("frame_seconds_by_view")
             out.pop("option_scores")
         results.append(out)
+        if args.save_every > 0 and len(results) % args.save_every == 0:
+            out_dir = os.path.dirname(args.output_file)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            json.dump(results, open(args.output_file, "w"), indent=2)
+            elapsed = time.time() - t0
+            print(f"[partial] Saved {len(results)}/{len(data)} results -> {args.output_file}; elapsed={elapsed:.1f}s", flush=True)
 
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    out_dir = os.path.dirname(args.output_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     json.dump(results, open(args.output_file, "w"), indent=2)
     print(f"Saved {len(results)} results -> {args.output_file}")
 

@@ -212,6 +212,10 @@ def create_dataset(dataset_type, config):
                     "end_token": config.model.get("end_token", "</Video>"),
                 })
                 dataset_kwargs.update(video_only_dataset_kwargs_train)
+                dataset_kwargs.update({
+                    "add_second_msg": config.model.get("add_second_msg", False),
+                    "tcr_multitask": config.model.get("tcr_multitask", False),
+                })
                 if "tgif" in train_file[1]:
                     video_only_dataset_kwargs_train.update({
                         "video_reader_type": "gif"

@@ -201,6 +201,10 @@ class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
             "pred_action_relation_intent": pred_rel_list,
             "action_label": sample.get("action_mathing_label", "[-1]"),
             "intent_label": sample.get("intent_mathing_label", "[-1]"),
+            "options": sample.get("options", qa.get("options", [])),
+            "ans": sample.get("ans", qa.get("ans", qa.get("answer_idx", qa.get("answer_id")))),
+            "answer_idx": sample.get("answer_idx", qa.get("answer_idx")),
+            "answer_id": sample.get("answer_id", qa.get("answer_id")),
             "question_id": sample.get("question_id", qa.get("question_id", index)),
         }
 
@@ -210,7 +214,7 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
 
     def __init__(self, ann_file, transform, num_frames=4, video_reader_type="decord", sample_type="rand", num_tries=3,
                  system="", start_token="<Video>", end_token="</Video>", add_second_msg=False,
-                 random_shuffle=True, return_question_instruction=False, dynamic_config=None):
+                 random_shuffle=True, return_question_instruction=False, dynamic_config=None, tcr_multitask=False):
         super().__init__(ann_file, transform, system=system, start_token=start_token, end_token=end_token,
                          random_shuffle=random_shuffle, return_question_instruction=return_question_instruction,
                          dynamic_config=dynamic_config)
@@ -220,7 +224,9 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
         self.sample_type = sample_type
         self.num_tries = num_tries
         self.add_second_msg = add_second_msg
-        self.tcr_multitask = bool(getattr(dynamic_config.model, "tcr_multitask", False)) if dynamic_config is not None and hasattr(dynamic_config, "model") else False
+        self.tcr_multitask = bool(tcr_multitask)
+        if dynamic_config is not None and hasattr(dynamic_config, "model"):
+            self.tcr_multitask = self.tcr_multitask or bool(getattr(dynamic_config.model, "tcr_multitask", False))
         self._video_index = self._build_video_index()
 
     def load_and_transform_tcr_video(self, index, video_path, question, mask_duration, all_duration, view="query"):
